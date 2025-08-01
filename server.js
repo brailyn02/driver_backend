@@ -392,7 +392,7 @@ app.get('/api/drivers/danger', async (req, res) => {
 });
 
 // Start server
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 WebSocket server ready for connections`);
   console.log(`🔗 API endpoints available at http://localhost:${PORT}/api/`);

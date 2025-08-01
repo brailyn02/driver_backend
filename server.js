@@ -7,7 +7,7 @@ const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000; // ✅ Fixed port to match logs
 
 // Middleware
 app.use(helmet());
@@ -22,13 +22,28 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
-// MongoDB Atlas Connection
-mongoose.connect(process.env.MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
+// ✅ Fixed MongoDB connection - removed deprecated options
+mongoose.connect(process.env.MONGODB_URI)
+.then(() => {
+  console.log('✅ Connected to MongoDB');
 })
-.then(() => console.log('✅ Connected to MongoDB'))
-.catch(err => console.error('❌ MongoDB connection error:', err));
+.catch(err => {
+  console.error('❌ MongoDB connection error:', err);
+  process.exit(1); // Exit if can't connect to prevent restart loop
+});
+
+// ✅ Add MongoDB connection event handlers
+mongoose.connection.on('error', (err) => {
+  console.error('❌ MongoDB connection error:', err);
+});
+
+mongoose.connection.on('disconnected', () => {
+  console.log('⚠️  MongoDB disconnected');
+});
+
+mongoose.connection.on('reconnected', () => {
+  console.log('✅ MongoDB reconnected');
+});
 
 // Driver Data Schema - SAFE/DANGER Only
 const driverSchema = new mongoose.Schema({
@@ -209,13 +224,16 @@ function parseSmsData(smsText) {
 
 // API Routes
 
-// Health check
+// Health check - ✅ Enhanced
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
     connections: activeConnections.size,
-    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    port: PORT
   });
 });
 
@@ -240,6 +258,14 @@ app.post('/api/sms/receive', async (req, res) => {
     // Validate required fields
     if (!parsedData.latitude || !parsedData.longitude) {
       return res.status(400).json({ error: 'Latitude and longitude are required' });
+    }
+    
+    // ✅ Add coordinate validation for Algeria
+    if (parsedData.latitude < 18.5 || parsedData.latitude > 38.0 || 
+        parsedData.longitude < -9.0 || parsedData.longitude > 12.0) {
+      console.log(`⚠️  Invalid coordinates for driver ${parsedData.driverId}: lat=${parsedData.latitude}, lng=${parsedData.longitude}`);
+      // You might want to reject invalid coordinates or use default values
+      // For now, we'll log the warning but still process the data
     }
     
     // Create driver data object
@@ -306,6 +332,7 @@ app.get('/api/drivers', async (req, res) => {
       }
     ]);
     
+    console.log(`✅ Fetched ${drivers.length} drivers`); // ✅ Add logging
     res.json(drivers);
   } catch (error) {
     console.error('Error fetching drivers:', error);
@@ -328,6 +355,7 @@ app.get('/api/drivers/:driverId/history', async (req, res) => {
     .sort({ timestamp: -1 })
     .limit(parseInt(limit));
     
+    console.log(`✅ Fetched ${history.length} history records for driver ${driverId}`); // ✅ Add logging
     res.json(history);
   } catch (error) {
     console.error('Error fetching driver history:', error);
@@ -356,6 +384,7 @@ app.get('/api/drivers/safe', async (req, res) => {
       }
     ]);
     
+    console.log(`✅ Fetched ${drivers.length} SAFE drivers`); // ✅ Add logging
     res.json(drivers);
   } catch (error) {
     console.error('Error fetching safe drivers:', error);
@@ -384,26 +413,72 @@ app.get('/api/drivers/danger', async (req, res) => {
       }
     ]);
     
+    console.log(`✅ Fetched ${drivers.length} DANGER drivers`); // ✅ Add logging
     res.json(drivers);
   } catch (error) {
     console.error('Error fetching danger drivers:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 // Root route to prevent "Cannot GET /"
 app.get('/', (req, res) => {
-  res.send('🚗 Driver backend is running. Use /api/health or /api/drivers.');
+  res.json({
+    message: '🚗 Driver Safety Monitoring Backend',
+    status: 'running',
+    endpoints: {
+      health: '/api/health',
+      drivers: '/api/drivers',
+      safeDrivers: '/api/drivers/safe',
+      dangerDrivers: '/api/drivers/danger',
+      smsReceive: '/api/sms/receive (POST)'
+    },
+    timestamp: new Date().toISOString()
+  });
 });
+
+// ✅ Add global error handlers
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('🚨 Unhandled Rejection at:', promise, 'reason:', reason);
+  // Don't exit in production - just log
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('🚨 Uncaught Exception:', error);
+  // Exit on uncaught exceptions
+  process.exit(1);
+});
+
+// ✅ Add memory monitoring
+setInterval(() => {
+  const used = process.memoryUsage();
+  console.log('💾 Memory usage:', {
+    rss: Math.round(used.rss / 1024 / 1024) + 'MB',
+    heapTotal: Math.round(used.heapTotal / 1024 / 1024) + 'MB',
+    heapUsed: Math.round(used.heapUsed / 1024 / 1024) + 'MB',
+    connections: activeConnections.size
+  });
+}, 60000); // Every minute
+
 // Start server
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 WebSocket server ready for connections`);
   console.log(`🔗 API endpoints available at http://localhost:${PORT}/api/`);
   console.log(`✅ Driver status: SAFE or DANGER only`);
+  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
+  console.log('👋 Shutting down gracefully...');
+  server.close(() => {
+    mongoose.connection.close();
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
   console.log('👋 Shutting down gracefully...');
   server.close(() => {
     mongoose.connection.close();

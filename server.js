@@ -45,11 +45,12 @@ mongoose.connection.on('reconnected', () => {
   console.log('✅ MongoDB reconnected');
 });
 
-// Driver Data Schema - SAFE/DANGER Only
+// 🆕 UPDATED Driver Data Schema - Added unique constraint for driverId
 const driverSchema = new mongoose.Schema({
   driverId: {
     type: String,
     required: true,
+    unique: true,  // 🆕 This ensures only one record per driver
     index: true
   },
   latitude: {
@@ -86,11 +87,26 @@ const driverSchema = new mongoose.Schema({
   rawSms: {
     type: String,
     default: null
+  },
+  // 🆕 Additional fields for tracking
+  lastUpdated: {
+    type: Date,
+    default: Date.now
+  },
+  updateCount: {
+    type: Number,
+    default: 1
   }
 });
 
-// Create compound index for efficient queries
-driverSchema.index({ driverId: 1, timestamp: -1 });
+// 🆕 Create unique index for driverId to prevent duplicates at DB level
+driverSchema.index({ driverId: 1 }, { unique: true });
+
+// 🆕 Pre-save hook to update lastUpdated
+driverSchema.pre('save', function(next) {
+  this.lastUpdated = new Date();
+  next();
+});
 
 const Driver = mongoose.model('Driver', driverSchema);
 
@@ -105,28 +121,17 @@ wss.on('connection', (ws) => {
   console.log('📱 New WebSocket connection established');
   activeConnections.add(ws);
   
-  // Send current driver data to new connection
-  Driver.aggregate([
-    {
-      $group: {
-        _id: '$driverId',
-        latestData: { $last: '$$ROOT' }
+  // 🆕 UPDATED: Send current driver data to new connection (no need for aggregation now)
+  Driver.find()
+    .sort({ timestamp: -1 })
+    .then(drivers => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'initial_data',
+          drivers: drivers
+        }));
       }
-    },
-    {
-      $replaceRoot: { newRoot: '$latestData' }
-    },
-    {
-      $sort: { timestamp: -1 }
-    }
-  ]).then(drivers => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: 'initial_data',
-        drivers: drivers
-      }));
-    }
-  }).catch(err => console.error('Error fetching initial data:', err));
+    }).catch(err => console.error('Error fetching initial data:', err));
 
   ws.on('close', () => {
     console.log('📱 WebSocket connection closed');
@@ -222,6 +227,38 @@ function parseSmsData(smsText) {
   }
 }
 
+// 🆕 NEW FUNCTION: Upsert driver data (update if exists, create if new)
+async function upsertDriverData(driverData) {
+  try {
+    const result = await Driver.findOneAndUpdate(
+      { driverId: driverData.driverId }, // Find by driverId
+      {
+        $set: {
+          latitude: driverData.latitude,
+          longitude: driverData.longitude,
+          status: driverData.status,
+          detailedStatus: driverData.detailedStatus,
+          recommendedAction: driverData.recommendedAction,
+          rawSms: driverData.rawSms,
+          timestamp: driverData.timestamp,
+          lastUpdated: new Date()
+        },
+        $inc: { updateCount: 1 } // Increment update counter
+      },
+      {
+        new: true,        // Return the updated document
+        upsert: true,     // Create if doesn't exist
+        runValidators: true
+      }
+    );
+
+    return result;
+  } catch (error) {
+    console.error('Error upserting driver data:', error);
+    throw error;
+  }
+}
+
 // API Routes
 
 // Health check - ✅ Enhanced
@@ -237,7 +274,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Receive SMS data from Android app
+// 🆕 UPDATED: Prevent duplicate SMS data
 app.post('/api/sms/receive', async (req, res) => {
   try {
     const { smsText, phoneNumber, timestamp } = req.body;
@@ -280,59 +317,60 @@ app.post('/api/sms/receive', async (req, res) => {
       timestamp: timestamp ? new Date(timestamp) : new Date()
     };
     
-    // Save to database
-    const driver = new Driver(driverData);
-    await driver.save();
+    // 🆕 UPDATED: Use upsert instead of creating new document
+    const savedDriver = await upsertDriverData(driverData);
     
-    console.log('✅ Driver data saved:', {
-      id: driverData.driverId,
-      status: driverData.status,
-      location: `${driverData.latitude}, ${driverData.longitude}`
+    const isNewDriver = savedDriver.updateCount === 1;
+    const actionTaken = isNewDriver ? 'created' : 'updated';
+    
+    console.log(`✅ Driver data ${actionTaken}:`, {
+      id: savedDriver.driverId,
+      status: savedDriver.status,
+      location: `${savedDriver.latitude}, ${savedDriver.longitude}`,
+      updateCount: savedDriver.updateCount
     });
     
     // Broadcast update to all connected clients
-    broadcastUpdate(driverData);
+    broadcastUpdate(savedDriver);
     
     // Send emergency alert if status is DANGER
-    if (driverData.status === 'DANGER') {
-      console.log('🚨 DANGER ALERT:', driverData.driverId);
+    if (savedDriver.status === 'DANGER') {
+      console.log('🚨 DANGER ALERT:', savedDriver.driverId);
       // Here you could add additional emergency notification logic
       // e.g., send push notifications, emails, etc.
     }
     
     res.json({
       success: true,
-      message: 'SMS data processed successfully',
-      driverId: driverData.driverId,
-      status: driverData.status,
-      timestamp: driverData.timestamp
+      message: `SMS data processed successfully (${actionTaken})`,
+      driverId: savedDriver.driverId,
+      status: savedDriver.status,
+      timestamp: savedDriver.timestamp,
+      updateCount: savedDriver.updateCount,
+      isNewDriver: isNewDriver
     });
     
   } catch (error) {
     console.error('Error processing SMS:', error);
+    
+    // Handle duplicate key error specifically
+    if (error.code === 11000) {
+      console.log('Duplicate key detected, retrying with upsert...');
+      // This shouldn't happen with our upsert approach, but just in case
+      return res.status(409).json({ error: 'Duplicate driver ID processed simultaneously' });
+    }
+    
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Get all drivers with their latest data
+// 🆕 UPDATED: Get all drivers (simplified since no duplicates now)
 app.get('/api/drivers', async (req, res) => {
   try {
-    const drivers = await Driver.aggregate([
-      {
-        $group: {
-          _id: '$driverId',
-          latestData: { $last: '$$ROOT' }
-        }
-      },
-      {
-        $replaceRoot: { newRoot: '$latestData' }
-      },
-      {
-        $sort: { timestamp: -1 }
-      }
-    ]);
+    const drivers = await Driver.find()
+      .sort({ timestamp: -1 });
     
-    console.log(`✅ Fetched ${drivers.length} drivers`); // ✅ Add logging
+    console.log(`✅ Fetched ${drivers.length} drivers (no duplicates)`);
     res.json(drivers);
   } catch (error) {
     console.error('Error fetching drivers:', error);
@@ -340,51 +378,57 @@ app.get('/api/drivers', async (req, res) => {
   }
 });
 
-// Get specific driver history
+// 🆕 NEW: Get specific driver current status
+app.get('/api/drivers/:driverId', async (req, res) => {
+  try {
+    const { driverId } = req.params;
+    
+    const driver = await Driver.findOne({ driverId });
+    
+    if (!driver) {
+      return res.status(404).json({ error: 'Driver not found' });
+    }
+    
+    console.log(`✅ Fetched driver ${driverId}`);
+    res.json(driver);
+  } catch (error) {
+    console.error('Error fetching driver:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// 🆕 NEW: Get driver update history (requires historical data collection)
 app.get('/api/drivers/:driverId/history', async (req, res) => {
   try {
     const { driverId } = req.params;
     const { limit = 50, hours = 24 } = req.query;
     
-    const startTime = new Date(Date.now() - hours * 60 * 60 * 1000);
+    // Since we now only keep latest data, we'd need a separate history collection
+    // For now, return the current driver data
+    const driver = await Driver.findOne({ driverId });
     
-    const history = await Driver.find({
-      driverId: driverId,
-      timestamp: { $gte: startTime }
-    })
-    .sort({ timestamp: -1 })
-    .limit(parseInt(limit));
+    if (!driver) {
+      return res.status(404).json({ 
+        error: 'Driver not found',
+        message: 'Historical data not available with current deduplication approach'
+      });
+    }
     
-    console.log(`✅ Fetched ${history.length} history records for driver ${driverId}`); // ✅ Add logging
-    res.json(history);
+    console.log(`✅ Fetched current data for driver ${driverId} (history not available)`);
+    res.json([driver]); // Return as array for consistency
   } catch (error) {
     console.error('Error fetching driver history:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Get SAFE drivers only
+// 🆕 UPDATED: Get SAFE drivers only (simplified)
 app.get('/api/drivers/safe', async (req, res) => {
   try {
-    const drivers = await Driver.aggregate([
-      {
-        $group: {
-          _id: '$driverId',
-          latestData: { $last: '$$ROOT' }
-        }
-      },
-      {
-        $replaceRoot: { newRoot: '$latestData' }
-      },
-      {
-        $match: { status: 'SAFE' }
-      },
-      {
-        $sort: { timestamp: -1 }
-      }
-    ]);
+    const drivers = await Driver.find({ status: 'SAFE' })
+      .sort({ timestamp: -1 });
     
-    console.log(`✅ Fetched ${drivers.length} SAFE drivers`); // ✅ Add logging
+    console.log(`✅ Fetched ${drivers.length} SAFE drivers`);
     res.json(drivers);
   } catch (error) {
     console.error('Error fetching safe drivers:', error);
@@ -392,28 +436,13 @@ app.get('/api/drivers/safe', async (req, res) => {
   }
 });
 
-// Get DANGER drivers only
+// 🆕 UPDATED: Get DANGER drivers only (simplified)
 app.get('/api/drivers/danger', async (req, res) => {
   try {
-    const drivers = await Driver.aggregate([
-      {
-        $group: {
-          _id: '$driverId',
-          latestData: { $last: '$$ROOT' }
-        }
-      },
-      {
-        $replaceRoot: { newRoot: '$latestData' }
-      },
-      {
-        $match: { status: 'DANGER' }
-      },
-      {
-        $sort: { timestamp: -1 }
-      }
-    ]);
+    const drivers = await Driver.find({ status: 'DANGER' })
+      .sort({ timestamp: -1 });
     
-    console.log(`✅ Fetched ${drivers.length} DANGER drivers`); // ✅ Add logging
+    console.log(`✅ Fetched ${drivers.length} DANGER drivers`);
     res.json(drivers);
   } catch (error) {
     console.error('Error fetching danger drivers:', error);
@@ -421,17 +450,107 @@ app.get('/api/drivers/danger', async (req, res) => {
   }
 });
 
+// 🆕 NEW: Get driver statistics
+app.get('/api/stats', async (req, res) => {
+  try {
+    const stats = await Driver.aggregate([
+      {
+        $group: {
+          _id: '$status',
+          count: { $sum: 1 },
+          avgUpdateCount: { $avg: '$updateCount' }
+        }
+      }
+    ]);
+    
+    const totalDrivers = await Driver.countDocuments();
+    
+    const result = {
+      totalDrivers,
+      byStatus: stats.reduce((acc, stat) => {
+        acc[stat._id] = {
+          count: stat.count,
+          avgUpdates: Math.round(stat.avgUpdateCount)
+        };
+        return acc;
+      }, {}),
+      timestamp: new Date().toISOString()
+    };
+    
+    console.log('✅ Fetched driver statistics');
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching stats:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// 🆕 NEW: Clean up old duplicates (run once to clean existing data)
+app.post('/api/admin/cleanup-duplicates', async (req, res) => {
+  try {
+    // First, let's see what we have
+    const allDrivers = await Driver.find().sort({ driverId: 1, timestamp: -1 });
+    
+    const duplicateGroups = {};
+    allDrivers.forEach(driver => {
+      if (!duplicateGroups[driver.driverId]) {
+        duplicateGroups[driver.driverId] = [];
+      }
+      duplicateGroups[driver.driverId].push(driver);
+    });
+    
+    let cleanedCount = 0;
+    
+    for (const [driverId, drivers] of Object.entries(duplicateGroups)) {
+      if (drivers.length > 1) {
+        // Keep the latest (first in our sorted array)
+        const latest = drivers[0];
+        const toDelete = drivers.slice(1);
+        
+        // Delete the older ones
+        await Driver.deleteMany({
+          _id: { $in: toDelete.map(d => d._id) }
+        });
+        
+        cleanedCount += toDelete.length;
+        console.log(`Cleaned ${toDelete.length} duplicates for driver ${driverId}`);
+      }
+    }
+    
+    console.log(`✅ Cleanup completed: removed ${cleanedCount} duplicate records`);
+    res.json({
+      success: true,
+      message: `Cleanup completed`,
+      duplicatesRemoved: cleanedCount,
+      remainingDrivers: Object.keys(duplicateGroups).length
+    });
+    
+  } catch (error) {
+    console.error('Error during cleanup:', error);
+    res.status(500).json({ error: 'Cleanup failed' });
+  }
+});
+
 // Root route to prevent "Cannot GET /"
 app.get('/', (req, res) => {
   res.json({
-    message: '🚗 Driver Safety Monitoring Backend',
+    message: '🚗 Driver Safety Monitoring Backend (Deduplication Enabled)',
     status: 'running',
+    features: [
+      '✅ No duplicate driver records',
+      '✅ Latest SMS data only',
+      '✅ Unique driver constraint',
+      '✅ Update tracking'
+    ],
     endpoints: {
       health: '/api/health',
       drivers: '/api/drivers',
+      driverById: '/api/drivers/:driverId',
       safeDrivers: '/api/drivers/safe',
       dangerDrivers: '/api/drivers/danger',
-      smsReceive: '/api/sms/receive (POST)'
+      stats: '/api/stats',
+      smsReceive: '/api/sms/receive (POST)',
+      cleanup: '/api/admin/cleanup-duplicates (POST)'
     },
     timestamp: new Date().toISOString()
   });
@@ -466,6 +585,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`📡 WebSocket server ready for connections`);
   console.log(`🔗 API endpoints available at http://localhost:${PORT}/api/`);
   console.log(`✅ Driver status: SAFE or DANGER only`);
+  console.log(`🆕 Deduplication: Enabled (only latest SMS per driver)`);
   console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
